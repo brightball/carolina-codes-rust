@@ -116,11 +116,13 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "deadpool-postgres",
+ "http-body-util",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tokio-postgres",
+ "tower",
  "url",
 ]
 

@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
@@ -33,6 +34,23 @@ const SPONSOR_COLS: &str =
 const TALK_COLS: &str =
     "slug, title, description, format, youtube_id, year, speaker_slug, languages, topics";
 const SPONSORSHIP_COLS: &str = "sponsor_slug, year, tier, blurb, featured";
+
+static SQL_COUNT: AtomicU64 = AtomicU64::new(0);
+static CONNECT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[allow(dead_code)]
+fn reset_counts() {
+    SQL_COUNT.store(0, Ordering::SeqCst);
+    CONNECT_COUNT.store(0, Ordering::SeqCst);
+}
+
+fn listen_host() -> &'static str {
+    "::"
+}
+
+fn listen_addr(port: u16) -> SocketAddr {
+    SocketAddr::from((listen_host().parse::<Ipv6Addr>().expect("listen host is IPv6"), port))
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -120,19 +138,7 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
-        .route("/v1/years", get(years))
-        .route("/v1/speakers", get(speakers))
-        .route("/v1/speakers/{year}/{slug}", get(speaker_year))
-        .route("/v1/speakers/{slug}", get(speaker_slug))
-        .route("/v1/sponsors", get(sponsors))
-        .route("/v1/sponsors/{year}/{slug}", get(sponsor_year))
-        .route("/v1/sponsors/{slug}", get(sponsor_slug))
-        .fallback(not_found)
-        .layer(middleware::map_response(polyglot_headers))
-        .with_state(AppState { pool });
+    let app = router(AppState { pool });
 
     let port: u16 = env::var("PORT")
         .ok()
@@ -140,7 +146,7 @@ async fn main() {
         .unwrap_or(4005);
     tokio::spawn(register(port));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = listen_addr(port);
     eprintln!("carolina-codes-rust listening on :{port}");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -152,6 +158,40 @@ async fn main() {
         eprintln!("server: {err}");
         std::process::exit(1);
     });
+}
+
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/health", get(health))
+        .route("/v1/years", get(years))
+        .route("/v1/speakers", get(speakers))
+        .route("/v1/speakers/{year}/{slug}", get(speaker_year))
+        .route("/v1/speakers/{slug}", get(speaker_slug))
+        .route("/v1/sponsors", get(sponsors))
+        .route("/v1/sponsors/{year}/{slug}", get(sponsor_year))
+        .route("/v1/sponsors/{slug}", get(sponsor_slug))
+        .fallback(not_found)
+        .layer(middleware::map_response(polyglot_headers))
+        .with_state(state)
+}
+
+async fn db_query(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<Row>, ApiError> {
+    SQL_COUNT.fetch_add(1, Ordering::SeqCst);
+    Ok(client.query(sql, params).await?)
+}
+
+async fn db_query_opt(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Option<Row>, ApiError> {
+    SQL_COUNT.fetch_add(1, Ordering::SeqCst);
+    Ok(client.query_opt(sql, params).await?)
 }
 
 async fn polyglot_headers(mut response: Response) -> Response {
@@ -178,12 +218,12 @@ async fn not_found() -> impl IntoResponse {
 
 async fn years(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let client = state.pool.get().await?;
-    let rows = client
-        .query(
-            "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC",
-            &[],
-        )
-        .await?;
+    let rows = db_query(
+        &client,
+        "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC",
+        &[],
+    )
+    .await?;
     let data: Vec<Value> = rows
         .iter()
         .map(|row| {
@@ -203,32 +243,7 @@ async fn speakers(
     Query(query): Query<YearQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let client = state.pool.get().await?;
-    if let Some(year) = query.year {
-        let sql = format!(
-            "SELECT {SPEAKER_COLS} FROM v1_speakers \
-             WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) \
-             ORDER BY last_name, first_name"
-        );
-        let rows = client.query(&sql, &[&year]).await?;
-        let mut speakers = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut speaker = speaker_from_row(&row);
-            let talks =
-                load_talks(&client, speaker["slug"].as_str().unwrap_or(""), Some(year)).await?;
-            let years = talk_years(&client, speaker["slug"].as_str().unwrap_or("")).await?;
-            speaker["year"] = json!(year);
-            speaker["talks"] = json!(talks);
-            speaker["languages"] = json!(uniq_tags(&talks, "languages"));
-            speaker["topics"] = json!(uniq_tags(&talks, "topics"));
-            speaker["years"] = json!(years);
-            speakers.push(speaker);
-        }
-        return Ok(Json(json!({ "data": speakers })));
-    }
-
-    let sql = format!("SELECT {SPEAKER_COLS} FROM v1_speakers ORDER BY last_name, first_name");
-    let rows = client.query(&sql, &[]).await?;
-    let data: Vec<Value> = rows.iter().map(speaker_from_row).collect();
+    let data = list_speakers(&client, query.year).await?;
     Ok(Json(json!({ "data": data })))
 }
 
@@ -276,11 +291,11 @@ async fn sponsors(
         let sql = format!(
             "SELECT {YEAR_SPONSOR_COLS} FROM v1_year_sponsors WHERE year = $1 ORDER BY name"
         );
-        let rows = client.query(&sql, &[&year]).await?;
+        let rows = db_query(&client, &sql, &[&year]).await?;
         rows.iter().map(year_sponsor_from_row).collect::<Vec<_>>()
     } else {
         let sql = format!("SELECT {SPONSOR_COLS} FROM v1_sponsors ORDER BY name");
-        let rows = client.query(&sql, &[]).await?;
+        let rows = db_query(&client, &sql, &[]).await?;
         rows.iter().map(sponsor_from_row).collect::<Vec<_>>()
     };
     Ok(Json(json!({ "data": data })))
@@ -293,8 +308,7 @@ async fn sponsor_year(
     let client = state.pool.get().await?;
     let sql =
         format!("SELECT {YEAR_SPONSOR_COLS} FROM v1_year_sponsors WHERE year = $1 AND slug = $2");
-    let row = client
-        .query_opt(&sql, &[&year, &slug])
+    let row = db_query_opt(&client, &sql, &[&year, &slug])
         .await?
         .ok_or(ApiError::NotFound)?;
     let mut sponsor = year_sponsor_from_row(&row);
@@ -310,15 +324,108 @@ async fn sponsor_slug(
 ) -> Result<Json<Value>, ApiError> {
     let client = state.pool.get().await?;
     let sql = format!("SELECT {SPONSOR_COLS} FROM v1_sponsors WHERE slug = $1");
-    let row = client
-        .query_opt(&sql, &[&slug])
+    let row = db_query_opt(&client, &sql, &[&slug])
         .await?
         .ok_or(ApiError::NotFound)?;
     let mut sponsor = sponsor_from_row(&row);
     let sql = format!("SELECT {SPONSORSHIP_COLS} FROM v1_sponsorships WHERE sponsor_slug = $1");
-    let rows = client.query(&sql, &[&slug]).await?;
+    let rows = db_query(&client, &sql, &[&slug]).await?;
     sponsor["sponsorships"] = json!(rows.iter().map(sponsorship_from_row).collect::<Vec<_>>());
     Ok(Json(json!({ "data": sponsor })))
+}
+
+async fn list_speakers(
+    client: &deadpool_postgres::Client,
+    year: Option<i64>,
+) -> Result<Vec<Value>, ApiError> {
+    if let Some(year) = year {
+        let sql = format!(
+            "SELECT {SPEAKER_COLS} FROM v1_speakers \
+             WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) \
+             ORDER BY last_name, first_name"
+        );
+        let rows = db_query(client, &sql, &[&year]).await?;
+        let mut speakers: Vec<Value> = rows.iter().map(speaker_from_row).collect();
+        attach_year_tags(client, &mut speakers, year).await?;
+        return Ok(speakers);
+    }
+    let sql = format!("SELECT {SPEAKER_COLS} FROM v1_speakers ORDER BY last_name, first_name");
+    let rows = db_query(client, &sql, &[]).await?;
+    Ok(rows.iter().map(speaker_from_row).collect())
+}
+
+async fn attach_year_tags(
+    client: &deadpool_postgres::Client,
+    speakers: &mut [Value],
+    year: i64,
+) -> Result<(), ApiError> {
+    if speakers.is_empty() {
+        return Ok(());
+    }
+    let slugs: Vec<String> = speakers
+        .iter()
+        .filter_map(|s| s.get("slug").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let talks_by = load_talks_for_year(client, year).await?;
+    let years_by = load_years_for_slugs(client, &slugs).await?;
+    for speaker in speakers.iter_mut() {
+        let slug = speaker
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let talks = talks_by.get(&slug).cloned().unwrap_or_default();
+        let years = years_by.get(&slug).cloned().unwrap_or_default();
+        speaker["year"] = json!(year);
+        speaker["talks"] = json!(talks);
+        speaker["languages"] = json!(uniq_tags(&talks, "languages"));
+        speaker["topics"] = json!(uniq_tags(&talks, "topics"));
+        speaker["years"] = json!(years);
+    }
+    Ok(())
+}
+
+async fn load_talks_for_year(
+    client: &deadpool_postgres::Client,
+    year: i64,
+) -> Result<HashMap<String, Vec<Value>>, ApiError> {
+    let sql = format!(
+        "SELECT {TALK_COLS} FROM v1_talks WHERE year = $1 ORDER BY speaker_slug, year DESC"
+    );
+    let rows = db_query(client, &sql, &[&year]).await?;
+    let mut out: HashMap<String, Vec<Value>> = HashMap::new();
+    for row in rows {
+        let talk = talk_from_row(&row);
+        let slug = talk
+            .get("speaker_slug")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.entry(slug).or_default().push(talk);
+    }
+    Ok(out)
+}
+
+async fn load_years_for_slugs(
+    client: &deadpool_postgres::Client,
+    slugs: &[String],
+) -> Result<HashMap<String, Vec<i64>>, ApiError> {
+    let mut out: HashMap<String, Vec<i64>> = HashMap::new();
+    if slugs.is_empty() {
+        return Ok(out);
+    }
+    let slug_list: Vec<String> = slugs.to_vec();
+    let rows = db_query(
+        client,
+        "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY($1) ORDER BY speaker_slug, year DESC",
+        &[&slug_list],
+    )
+    .await?;
+    for row in rows {
+        let slug: String = row.get("speaker_slug");
+        out.entry(slug).or_default().push(year_value(&row));
+    }
+    Ok(out)
 }
 
 async fn load_speaker(
@@ -326,8 +433,7 @@ async fn load_speaker(
     slug: &str,
 ) -> Result<Option<Value>, ApiError> {
     let sql = format!("SELECT {SPEAKER_COLS} FROM v1_speakers WHERE slug = $1");
-    Ok(client
-        .query_opt(&sql, &[&slug])
+    Ok(db_query_opt(client, &sql, &[&slug])
         .await?
         .map(|row| speaker_from_row(&row)))
 }
@@ -343,20 +449,20 @@ async fn load_talks(
         "SELECT {TALK_COLS} FROM v1_talks WHERE speaker_slug = $1 AND year = $2 ORDER BY year DESC"
     );
     let rows = if let Some(year) = year {
-        client.query(&sql_year, &[&slug, &year]).await?
+        db_query(client, &sql_year, &[&slug, &year]).await?
     } else {
-        client.query(&sql_all, &[&slug]).await?
+        db_query(client, &sql_all, &[&slug]).await?
     };
     Ok(rows.iter().map(talk_from_row).collect())
 }
 
 async fn talk_years(client: &deadpool_postgres::Client, slug: &str) -> Result<Vec<i64>, ApiError> {
-    let rows = client
-        .query(
-            "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC",
-            &[&slug],
-        )
-        .await?;
+    let rows = db_query(
+        client,
+        "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC",
+        &[&slug],
+    )
+    .await?;
     Ok(rows.iter().map(year_value).collect())
 }
 
@@ -364,12 +470,12 @@ async fn sponsor_years(
     client: &deadpool_postgres::Client,
     slug: &str,
 ) -> Result<Vec<i64>, ApiError> {
-    let rows = client
-        .query(
-            "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC",
-            &[&slug],
-        )
-        .await?;
+    let rows = db_query(
+        client,
+        "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC",
+        &[&slug],
+    )
+    .await?;
     Ok(rows.iter().map(year_value).collect())
 }
 
@@ -493,6 +599,7 @@ fn except_year(years: &[i64], year: i64) -> Vec<i64> {
 }
 
 fn db_pool(database_url: &str) -> Result<Pool, Box<dyn std::error::Error + Send + Sync>> {
+    CONNECT_COUNT.fetch_add(1, Ordering::SeqCst);
     let cfg = postgres_config(database_url)?;
     let mgr = Manager::from_config(
         cfg,
@@ -606,6 +713,7 @@ async fn register(port: u16) {
     }
 }
 
+#[derive(Debug)]
 enum ApiError {
     NotFound,
     Db(String),
@@ -638,5 +746,170 @@ impl From<tokio_postgres::Error> for ApiError {
 impl From<deadpool_postgres::PoolError> for ApiError {
     fn from(err: deadpool_postgres::PoolError) -> Self {
         ApiError::Db(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use std::sync::{Mutex, MutexGuard};
+    use tower::ServiceExt;
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn src() -> &'static str {
+        include_str!("main.rs")
+    }
+
+    fn assert_years_desc(speakers: &[Value], label: &str) {
+        let mut found_multi = false;
+        for sp in speakers {
+            let years = sp
+                .get("years")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_i64())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if years.len() < 2 {
+                continue;
+            }
+            found_multi = true;
+            for pair in years.windows(2) {
+                assert!(
+                    pair[0] >= pair[1],
+                    "{label} years not DESC for {:?}: {years:?}",
+                    sp.get("slug")
+                );
+            }
+        }
+        assert!(found_multi, "{label} expected a speaker with >=2 years");
+    }
+
+    #[test]
+    fn listen_addr_is_ipv6() {
+        assert_eq!(listen_host(), "::");
+        assert!(listen_addr(4005).is_ipv6());
+        let ipv4_any = format!("([{z}, {z}, {z}, {z}]", z = 0);
+        assert!(!src().contains(&ipv4_any), "source still binds IPv4-only");
+        assert!(src().contains("listen_addr("), "main should bind listen_addr");
+        assert!(src().contains("NoTls"), "tokio-postgres stays NoTls");
+        let reg = src()
+            .split("async fn register(")
+            .nth(1)
+            .unwrap_or("");
+        assert!(!reg.contains("db_query("), "register-once does not run catalog SQL");
+        assert!(!reg.contains("db_pool("), "register-once does not open the pool");
+        assert!(!reg.contains("pool.get("), "register-once does not check out a connection");
+    }
+
+    #[tokio::test]
+    async fn health_does_not_query_or_connect() {
+        let _guard = test_guard();
+        reset_counts();
+        let pool = db_pool(&test_db_url()).expect("open pool for state");
+        let boot = CONNECT_COUNT.load(Ordering::SeqCst);
+        SQL_COUNT.store(0, Ordering::SeqCst);
+        let response = router(AppState { pool })
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(SQL_COUNT.load(Ordering::SeqCst), 0, "/health ran SQL");
+        assert_eq!(
+            CONNECT_COUNT.load(Ordering::SeqCst),
+            boot,
+            "/health opened Postgres"
+        );
+    }
+
+    #[tokio::test]
+    async fn year_listing_sql_bounded_and_years_desc() {
+        let _guard = test_guard();
+        reset_counts();
+        let pool = db_pool(&test_db_url()).expect("live carolina_dev pool");
+        let boot = CONNECT_COUNT.load(Ordering::SeqCst);
+        SQL_COUNT.store(0, Ordering::SeqCst);
+        let app = router(AppState { pool: pool.clone() });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/speakers?year=2026")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).expect("json");
+        let speakers = payload["data"].as_array().cloned().unwrap_or_default();
+        let sql = SQL_COUNT.load(Ordering::SeqCst);
+        eprintln!(
+            "year list status={} sql={} speakers={} connects={}",
+            status.as_u16(),
+            sql,
+            speakers.len(),
+            CONNECT_COUNT.load(Ordering::SeqCst)
+        );
+        assert_eq!(status, StatusCode::OK, "live year listing {}", payload);
+        assert!(speakers.len() >= 3, "year listing returns N>=3 speakers");
+        assert!(sql > 0, "listing runs SQL through shipped query wrapper");
+        assert!(
+            sql < 2 * speakers.len() as u64,
+            "SQL count {sql} grew like 2N for N={}",
+            speakers.len()
+        );
+        assert!(sql <= 4, "year listing SQL {sql} should be speakers+talks+years");
+        assert_years_desc(&speakers, "handler");
+        assert_eq!(
+            CONNECT_COUNT.load(Ordering::SeqCst),
+            boot,
+            "listing opened a new session"
+        );
+
+        let client = pool.get().await.expect("checkout");
+        let rows = list_speakers(&client, Some(2026)).await.expect("list_speakers");
+        assert_years_desc(&rows, "list_speakers");
+
+        SQL_COUNT.store(0, Ordering::SeqCst);
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/speakers?year=2026")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            CONNECT_COUNT.load(Ordering::SeqCst),
+            boot,
+            "second catalog request opened a new session"
+        );
+    }
+
+    fn test_db_url() -> String {
+        env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev".into()
+        })
     }
 }
