@@ -5,15 +5,20 @@ edition = "2021"
 description = "Read-only v1 polyglot API for Carolina Code Conference"
 publish = false
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [dependencies]
 axum = "0.8"
 deadpool-postgres = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "net", "time"] }
 tokio-postgres = "0.7"
-url = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"

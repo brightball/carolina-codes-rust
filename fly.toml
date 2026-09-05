@@ -8,6 +8,7 @@ primary_region = "iad"
 
 [env]
   PORT = "8080"
+  TOKIO_WORKER_THREADS = "1"
   CAROLINA_URL = "http://carolina-codes.internal:8080"
   PUBLIC_BASE_URL = "https://carolina-codes-rust.fly.dev"
 

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -13,8 +13,8 @@ use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio_postgres::config::Host;
 use tokio_postgres::{NoTls, Row};
-use url::Url;
 
 const LANGUAGE: &str = "Rust";
 const API_VERSION: &str = "0.2.0";
@@ -23,17 +23,44 @@ const CREATED_YEAR: i32 = 2026;
 const SCHEMA_VERSION: i32 = 1;
 const LANGUAGE_VERSION: &str = env!("RUSTC_VERSION");
 
-const SPEAKER_COLS: &str = "slug, first_name, last_name, name, tagline, bio, company, location, \
-     photo_path, twitter_url, linkedin_url, website_url, github_url, featured";
-const YEAR_SPONSOR_COLS: &str =
-    "slug, name, website, logo_path, description, blurb, tier, featured, year, \
-     twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url";
-const SPONSOR_COLS: &str =
-    "slug, name, website, logo_path, description, twitter_url, linkedin_url, \
-     youtube_url, instagram_url, facebook_url";
-const TALK_COLS: &str =
-    "slug, title, description, format, youtube_id, year, speaker_slug, languages, topics";
-const SPONSORSHIP_COLS: &str = "sponsor_slug, year, tier, blurb, featured";
+const SQL_YEARS: &str = "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC";
+const SQL_SPEAKERS: &str = "SELECT slug, first_name, last_name, name, tagline, bio, company, \
+     location, photo_path, twitter_url, linkedin_url, website_url, github_url, featured \
+     FROM v1_speakers ORDER BY last_name, first_name";
+const SQL_SPEAKERS_FOR_YEAR: &str = "SELECT slug, first_name, last_name, name, tagline, bio, \
+     company, location, photo_path, twitter_url, linkedin_url, website_url, github_url, featured \
+     FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) \
+     ORDER BY last_name, first_name";
+const SQL_SPEAKER_BY_SLUG: &str = "SELECT slug, first_name, last_name, name, tagline, bio, \
+     company, location, photo_path, twitter_url, linkedin_url, website_url, github_url, featured \
+     FROM v1_speakers WHERE slug = $1";
+const SQL_TALKS_FOR_YEAR: &str = "SELECT slug, title, description, format, youtube_id, year, \
+     speaker_slug, languages, topics FROM v1_talks WHERE year = $1 \
+     ORDER BY speaker_slug, year DESC";
+const SQL_TALKS_BY_SLUG: &str = "SELECT slug, title, description, format, youtube_id, year, \
+     speaker_slug, languages, topics FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC";
+const SQL_TALKS_BY_SLUG_YEAR: &str = "SELECT slug, title, description, format, youtube_id, year, \
+     speaker_slug, languages, topics FROM v1_talks WHERE speaker_slug = $1 AND year = $2 \
+     ORDER BY year DESC";
+const SQL_TALK_YEARS: &str =
+    "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC";
+const SQL_YEARS_FOR_SLUGS: &str = "SELECT DISTINCT speaker_slug, year FROM v1_talks \
+     WHERE speaker_slug = ANY($1) ORDER BY speaker_slug, year DESC";
+const SQL_YEAR_SPONSORS: &str = "SELECT slug, name, website, logo_path, description, blurb, \
+     tier, featured, year, twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url \
+     FROM v1_year_sponsors WHERE year = $1 ORDER BY name";
+const SQL_YEAR_SPONSOR: &str = "SELECT slug, name, website, logo_path, description, blurb, \
+     tier, featured, year, twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url \
+     FROM v1_year_sponsors WHERE year = $1 AND slug = $2";
+const SQL_SPONSORS: &str = "SELECT slug, name, website, logo_path, description, twitter_url, \
+     linkedin_url, youtube_url, instagram_url, facebook_url FROM v1_sponsors ORDER BY name";
+const SQL_SPONSOR_BY_SLUG: &str = "SELECT slug, name, website, logo_path, description, \
+     twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url \
+     FROM v1_sponsors WHERE slug = $1";
+const SQL_SPONSORSHIPS: &str =
+    "SELECT sponsor_slug, year, tier, blurb, featured FROM v1_sponsorships WHERE sponsor_slug = $1";
+const SQL_SPONSOR_YEARS: &str =
+    "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC";
 
 static SQL_COUNT: AtomicU64 = AtomicU64::new(0);
 static CONNECT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -49,7 +76,12 @@ fn listen_host() -> &'static str {
 }
 
 fn listen_addr(port: u16) -> SocketAddr {
-    SocketAddr::from((listen_host().parse::<Ipv6Addr>().expect("listen host is IPv6"), port))
+    SocketAddr::from((
+        listen_host()
+            .parse::<Ipv6Addr>()
+            .expect("listen host is IPv6"),
+        port,
+    ))
 }
 
 #[derive(Clone)]
@@ -129,7 +161,7 @@ fn identity() -> Value {
     })
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let database_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev".into());
@@ -137,6 +169,7 @@ async fn main() {
         eprintln!("database config: {err}");
         std::process::exit(1);
     });
+    prewarm_pool(&pool).await;
 
     let app = router(AppState { pool });
 
@@ -182,7 +215,8 @@ async fn db_query(
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Vec<Row>, ApiError> {
     SQL_COUNT.fetch_add(1, Ordering::SeqCst);
-    Ok(client.query(sql, params).await?)
+    let stmt = client.prepare_cached(sql).await?;
+    Ok(client.query(&stmt, params).await?)
 }
 
 async fn db_query_opt(
@@ -191,7 +225,8 @@ async fn db_query_opt(
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
 ) -> Result<Option<Row>, ApiError> {
     SQL_COUNT.fetch_add(1, Ordering::SeqCst);
-    Ok(client.query_opt(sql, params).await?)
+    let stmt = client.prepare_cached(sql).await?;
+    Ok(client.query_opt(&stmt, params).await?)
 }
 
 async fn polyglot_headers(mut response: Response) -> Response {
@@ -218,12 +253,7 @@ async fn not_found() -> impl IntoResponse {
 
 async fn years(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let client = state.pool.get().await?;
-    let rows = db_query(
-        &client,
-        "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC",
-        &[],
-    )
-    .await?;
+    let rows = db_query(&client, SQL_YEARS, &[]).await?;
     let data: Vec<Value> = rows
         .iter()
         .map(|row| {
@@ -288,14 +318,10 @@ async fn sponsors(
 ) -> Result<Json<Value>, ApiError> {
     let client = state.pool.get().await?;
     let data = if let Some(year) = query.year {
-        let sql = format!(
-            "SELECT {YEAR_SPONSOR_COLS} FROM v1_year_sponsors WHERE year = $1 ORDER BY name"
-        );
-        let rows = db_query(&client, &sql, &[&year]).await?;
+        let rows = db_query(&client, SQL_YEAR_SPONSORS, &[&year]).await?;
         rows.iter().map(year_sponsor_from_row).collect::<Vec<_>>()
     } else {
-        let sql = format!("SELECT {SPONSOR_COLS} FROM v1_sponsors ORDER BY name");
-        let rows = db_query(&client, &sql, &[]).await?;
+        let rows = db_query(&client, SQL_SPONSORS, &[]).await?;
         rows.iter().map(sponsor_from_row).collect::<Vec<_>>()
     };
     Ok(Json(json!({ "data": data })))
@@ -306,9 +332,7 @@ async fn sponsor_year(
     Path((year, slug)): Path<(i64, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let client = state.pool.get().await?;
-    let sql =
-        format!("SELECT {YEAR_SPONSOR_COLS} FROM v1_year_sponsors WHERE year = $1 AND slug = $2");
-    let row = db_query_opt(&client, &sql, &[&year, &slug])
+    let row = db_query_opt(&client, SQL_YEAR_SPONSOR, &[&year, &slug])
         .await?
         .ok_or(ApiError::NotFound)?;
     let mut sponsor = year_sponsor_from_row(&row);
@@ -323,13 +347,11 @@ async fn sponsor_slug(
     Path(slug): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let client = state.pool.get().await?;
-    let sql = format!("SELECT {SPONSOR_COLS} FROM v1_sponsors WHERE slug = $1");
-    let row = db_query_opt(&client, &sql, &[&slug])
+    let row = db_query_opt(&client, SQL_SPONSOR_BY_SLUG, &[&slug])
         .await?
         .ok_or(ApiError::NotFound)?;
     let mut sponsor = sponsor_from_row(&row);
-    let sql = format!("SELECT {SPONSORSHIP_COLS} FROM v1_sponsorships WHERE sponsor_slug = $1");
-    let rows = db_query(&client, &sql, &[&slug]).await?;
+    let rows = db_query(&client, SQL_SPONSORSHIPS, &[&slug]).await?;
     sponsor["sponsorships"] = json!(rows.iter().map(sponsorship_from_row).collect::<Vec<_>>());
     Ok(Json(json!({ "data": sponsor })))
 }
@@ -339,18 +361,12 @@ async fn list_speakers(
     year: Option<i64>,
 ) -> Result<Vec<Value>, ApiError> {
     if let Some(year) = year {
-        let sql = format!(
-            "SELECT {SPEAKER_COLS} FROM v1_speakers \
-             WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = $1) \
-             ORDER BY last_name, first_name"
-        );
-        let rows = db_query(client, &sql, &[&year]).await?;
+        let rows = db_query(client, SQL_SPEAKERS_FOR_YEAR, &[&year]).await?;
         let mut speakers: Vec<Value> = rows.iter().map(speaker_from_row).collect();
         attach_year_tags(client, &mut speakers, year).await?;
         return Ok(speakers);
     }
-    let sql = format!("SELECT {SPEAKER_COLS} FROM v1_speakers ORDER BY last_name, first_name");
-    let rows = db_query(client, &sql, &[]).await?;
+    let rows = db_query(client, SQL_SPEAKERS, &[]).await?;
     Ok(rows.iter().map(speaker_from_row).collect())
 }
 
@@ -389,10 +405,7 @@ async fn load_talks_for_year(
     client: &deadpool_postgres::Client,
     year: i64,
 ) -> Result<HashMap<String, Vec<Value>>, ApiError> {
-    let sql = format!(
-        "SELECT {TALK_COLS} FROM v1_talks WHERE year = $1 ORDER BY speaker_slug, year DESC"
-    );
-    let rows = db_query(client, &sql, &[&year]).await?;
+    let rows = db_query(client, SQL_TALKS_FOR_YEAR, &[&year]).await?;
     let mut out: HashMap<String, Vec<Value>> = HashMap::new();
     for row in rows {
         let talk = talk_from_row(&row);
@@ -415,12 +428,7 @@ async fn load_years_for_slugs(
         return Ok(out);
     }
     let slug_list: Vec<String> = slugs.to_vec();
-    let rows = db_query(
-        client,
-        "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY($1) ORDER BY speaker_slug, year DESC",
-        &[&slug_list],
-    )
-    .await?;
+    let rows = db_query(client, SQL_YEARS_FOR_SLUGS, &[&slug_list]).await?;
     for row in rows {
         let slug: String = row.get("speaker_slug");
         out.entry(slug).or_default().push(year_value(&row));
@@ -432,8 +440,7 @@ async fn load_speaker(
     client: &deadpool_postgres::Client,
     slug: &str,
 ) -> Result<Option<Value>, ApiError> {
-    let sql = format!("SELECT {SPEAKER_COLS} FROM v1_speakers WHERE slug = $1");
-    Ok(db_query_opt(client, &sql, &[&slug])
+    Ok(db_query_opt(client, SQL_SPEAKER_BY_SLUG, &[&slug])
         .await?
         .map(|row| speaker_from_row(&row)))
 }
@@ -443,26 +450,16 @@ async fn load_talks(
     slug: &str,
     year: Option<i64>,
 ) -> Result<Vec<Value>, ApiError> {
-    let sql_all =
-        format!("SELECT {TALK_COLS} FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC");
-    let sql_year = format!(
-        "SELECT {TALK_COLS} FROM v1_talks WHERE speaker_slug = $1 AND year = $2 ORDER BY year DESC"
-    );
     let rows = if let Some(year) = year {
-        db_query(client, &sql_year, &[&slug, &year]).await?
+        db_query(client, SQL_TALKS_BY_SLUG_YEAR, &[&slug, &year]).await?
     } else {
-        db_query(client, &sql_all, &[&slug]).await?
+        db_query(client, SQL_TALKS_BY_SLUG, &[&slug]).await?
     };
     Ok(rows.iter().map(talk_from_row).collect())
 }
 
 async fn talk_years(client: &deadpool_postgres::Client, slug: &str) -> Result<Vec<i64>, ApiError> {
-    let rows = db_query(
-        client,
-        "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = $1 ORDER BY year DESC",
-        &[&slug],
-    )
-    .await?;
+    let rows = db_query(client, SQL_TALK_YEARS, &[&slug]).await?;
     Ok(rows.iter().map(year_value).collect())
 }
 
@@ -470,12 +467,7 @@ async fn sponsor_years(
     client: &deadpool_postgres::Client,
     slug: &str,
 ) -> Result<Vec<i64>, ApiError> {
-    let rows = db_query(
-        client,
-        "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = $1 ORDER BY year DESC",
-        &[&slug],
-    )
-    .await?;
+    let rows = db_query(client, SQL_SPONSOR_YEARS, &[&slug]).await?;
     Ok(rows.iter().map(year_value).collect())
 }
 
@@ -609,60 +601,72 @@ fn db_pool(database_url: &str) -> Result<Pool, Box<dyn std::error::Error + Send 
         },
     );
     Ok(Pool::builder(mgr)
-        .max_size(16)
+        .max_size(4)
         .runtime(Runtime::Tokio1)
         .build()?)
+}
+
+async fn prewarm_pool(pool: &Pool) {
+    let mut held = Vec::with_capacity(2);
+    for _ in 0..2 {
+        match pool.get().await {
+            Ok(client) => held.push(client),
+            Err(err) => {
+                eprintln!("prewarm: {err}");
+                break;
+            }
+        }
+    }
 }
 
 fn postgres_config(
     database_url: &str,
 ) -> Result<tokio_postgres::Config, Box<dyn std::error::Error + Send + Sync>> {
-    if !database_url.contains("://") {
-        return Ok(database_url.parse()?);
+    let mut cfg: tokio_postgres::Config = database_url.parse()?;
+    if cfg.get_connect_timeout().is_none() {
+        cfg.connect_timeout(Duration::from_secs(3));
     }
-    let parsed = Url::parse(database_url)?;
-    let mut cfg = tokio_postgres::Config::new();
-    if let Some(host) = parsed.host_str() {
-        cfg.host(host);
-    }
-    cfg.port(parsed.port().unwrap_or(5432));
-    let dbname = parsed.path().trim_start_matches('/');
-    if !dbname.is_empty() {
-        cfg.dbname(dbname);
-    }
-    if !parsed.username().is_empty() {
-        cfg.user(&pct_decode(parsed.username()));
-    }
-    if let Some(password) = parsed.password() {
-        cfg.password(pct_decode(password));
-    }
+    prefer_fly_ipv6(&mut cfg);
     Ok(cfg)
 }
 
-fn pct_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+fn is_fly_pg_host(name: &str) -> bool {
+    name.contains("flycast") || name.contains(".internal") || name.contains(".fly.io")
 }
 
-fn from_hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
+fn resolve_ipv6(host: &str, port: u16) -> Option<IpAddr> {
+    (host, port)
+        .to_socket_addrs()
+        .ok()?
+        .find(SocketAddr::is_ipv6)
+        .map(|addr| addr.ip())
+}
+
+fn prefer_fly_ipv6(cfg: &mut tokio_postgres::Config) {
+    if !cfg.get_hostaddrs().is_empty() {
+        return;
+    }
+    let hosts: Vec<String> = cfg
+        .get_hosts()
+        .iter()
+        .filter_map(|host| match host {
+            Host::Tcp(name) if is_fly_pg_host(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    if hosts.is_empty() {
+        return;
+    }
+    let ports = cfg.get_ports().to_vec();
+    for (i, name) in hosts.iter().enumerate() {
+        let port = ports
+            .get(i)
+            .copied()
+            .or_else(|| ports.first().copied())
+            .unwrap_or(5432);
+        if let Some(ip) = resolve_ipv6(name, port) {
+            cfg.hostaddr(ip);
+        }
     }
 }
 
@@ -773,11 +777,7 @@ mod tests {
             let years = sp
                 .get("years")
                 .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_i64())
-                        .collect::<Vec<_>>()
-                })
+                .map(|a| a.iter().filter_map(|v| v.as_i64()).collect::<Vec<_>>())
                 .unwrap_or_default();
             if years.len() < 2 {
                 continue;
@@ -800,15 +800,45 @@ mod tests {
         assert!(listen_addr(4005).is_ipv6());
         let ipv4_any = format!("([{z}, {z}, {z}, {z}]", z = 0);
         assert!(!src().contains(&ipv4_any), "source still binds IPv4-only");
-        assert!(src().contains("listen_addr("), "main should bind listen_addr");
+        assert!(
+            src().contains("listen_addr("),
+            "main should bind listen_addr"
+        );
         assert!(src().contains("NoTls"), "tokio-postgres stays NoTls");
-        let reg = src()
-            .split("async fn register(")
-            .nth(1)
-            .unwrap_or("");
-        assert!(!reg.contains("db_query("), "register-once does not run catalog SQL");
-        assert!(!reg.contains("db_pool("), "register-once does not open the pool");
-        assert!(!reg.contains("pool.get("), "register-once does not check out a connection");
+        assert!(
+            src().contains("prepare_cached"),
+            "queries use the pool statement cache"
+        );
+        assert!(
+            src().contains("current_thread"),
+            "single-worker tokio runtime"
+        );
+        assert!(src().contains("max_size(4)"), "pool sized for 1 CPU");
+        let reg = src().split("async fn register(").nth(1).unwrap_or("");
+        assert!(
+            !reg.contains("db_query("),
+            "register-once does not run catalog SQL"
+        );
+        assert!(
+            !reg.contains("db_pool("),
+            "register-once does not open the pool"
+        );
+        assert!(
+            !reg.contains("pool.get("),
+            "register-once does not check out a connection"
+        );
+    }
+
+    #[test]
+    fn postgres_config_parses_url_and_sets_timeout() {
+        let cfg = postgres_config("postgres://u:p@127.0.0.1:5432/carolina_dev").expect("parse");
+        assert_eq!(cfg.get_connect_timeout(), Some(&Duration::from_secs(3)));
+        assert_eq!(cfg.get_user(), Some("u"));
+        assert_eq!(cfg.get_dbname(), Some("carolina_dev"));
+        assert!(cfg.get_hostaddrs().is_empty(), "loopback is not a Fly host");
+        assert!(is_fly_pg_host("carolina-codes-db.flycast"));
+        assert!(is_fly_pg_host("carolina-codes-db.internal"));
+        assert!(!is_fly_pg_host("127.0.0.1"));
     }
 
     #[tokio::test]
@@ -877,7 +907,10 @@ mod tests {
             "SQL count {sql} grew like 2N for N={}",
             speakers.len()
         );
-        assert!(sql <= 4, "year listing SQL {sql} should be speakers+talks+years");
+        assert!(
+            sql <= 4,
+            "year listing SQL {sql} should be speakers+talks+years"
+        );
         assert_years_desc(&speakers, "handler");
         assert_eq!(
             CONNECT_COUNT.load(Ordering::SeqCst),
@@ -886,7 +919,9 @@ mod tests {
         );
 
         let client = pool.get().await.expect("checkout");
-        let rows = list_speakers(&client, Some(2026)).await.expect("list_speakers");
+        let rows = list_speakers(&client, Some(2026))
+            .await
+            .expect("list_speakers");
         assert_years_desc(&rows, "list_speakers");
 
         SQL_COUNT.store(0, Ordering::SeqCst);
@@ -908,8 +943,7 @@ mod tests {
     }
 
     fn test_db_url() -> String {
-        env::var("DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev".into()
-        })
+        env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev".into())
     }
 }
