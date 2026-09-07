@@ -1,0 +1,14 @@
+{
+  "name": "carolina-codes-rust",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "install": "cargo fetch",
+  "ports": [
+    {
+      "name": "api",
+      "port": 4005
+    }
+  ]
+}
