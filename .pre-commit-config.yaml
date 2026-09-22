@@ -1,0 +1,35 @@
+# Local pre-commit hooks. Emergency escape: SKIP=fmt,clippy,local-tests,audit,gitleaks git commit
+# Install once: make hooks   (or: pre-commit install)
+repos:
+  - repo: local
+    hooks:
+      - id: fmt
+        name: rustfmt
+        language: system
+        entry: make fmt
+        pass_filenames: false
+        always_run: true
+      - id: clippy
+        name: clippy
+        language: system
+        entry: make clippy
+        pass_filenames: false
+        always_run: true
+      - id: local-tests
+        name: local tests
+        language: system
+        entry: make test
+        pass_filenames: false
+        always_run: true
+      - id: audit
+        name: 3rd-party dependency scanner
+        language: system
+        entry: make audit
+        pass_filenames: false
+        always_run: true
+      - id: gitleaks
+        name: gitleaks
+        language: system
+        entry: make secrets
+        pass_filenames: false
+        always_run: true

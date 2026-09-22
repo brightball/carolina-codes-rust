@@ -161,36 +161,56 @@ fn identity() -> Value {
     })
 }
 
+struct Settings {
+    database_url: String,
+    port: u16,
+    carolina_url: String,
+    register_token: String,
+    public_base_url: String,
+}
+
+impl Settings {
+    fn from_env() -> Self {
+        Self {
+            database_url: env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev".into()
+            }),
+            port: env::var("PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(4005),
+            carolina_url: env::var("CAROLINA_URL").unwrap_or_default(),
+            register_token: env::var("POLYGLOT_REGISTER_TOKEN").unwrap_or_default(),
+            public_base_url: env::var("PUBLIC_BASE_URL").unwrap_or_default(),
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev".into());
-    let pool = db_pool(&database_url).unwrap_or_else(|err| {
-        eprintln!("database config: {err}");
+    if let Err(err) = boot(Settings::from_env()).await {
+        eprintln!("{err}");
         std::process::exit(1);
-    });
-    prewarm_pool(&pool).await;
+    }
+}
 
-    let app = router(AppState { pool });
-
-    let port: u16 = env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(4005);
-    tokio::spawn(register(port));
-
-    let addr = listen_addr(port);
-    eprintln!("carolina-codes-rust listening on :{port}");
-    let listener = tokio::net::TcpListener::bind(addr)
+async fn boot(settings: Settings) -> Result<(), String> {
+    let pool = db_pool(&settings.database_url).map_err(|err| format!("database config: {err}"))?;
+    let app = router(AppState { pool: pool.clone() });
+    let port = settings.port;
+    // Bind before warmup so /health does not wait on the Postgres connect timeout.
+    let listener = tokio::net::TcpListener::bind(listen_addr(port))
         .await
-        .unwrap_or_else(|err| {
-            eprintln!("bind: {err}");
-            std::process::exit(1);
-        });
-    axum::serve(listener, app).await.unwrap_or_else(|err| {
-        eprintln!("server: {err}");
-        std::process::exit(1);
+        .map_err(|err| format!("bind: {err}"))?;
+    eprintln!("carolina-codes-rust listening on :{port}");
+    tokio::spawn(async move {
+        prewarm_pool(&pool).await;
     });
+    tokio::spawn(register(settings));
+    axum::serve(listener, app)
+        .await
+        .map_err(|err| format!("server: {err}"))?;
+    Ok(())
 }
 
 fn router(state: AppState) -> Router {
@@ -670,16 +690,20 @@ fn prefer_fly_ipv6(cfg: &mut tokio_postgres::Config) {
     }
 }
 
-async fn register(port: u16) {
-    let url = match env::var("CAROLINA_URL") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
+async fn register(settings: Settings) {
+    let url = settings.carolina_url;
+    if url.is_empty() {
+        return;
+    }
+    let token = settings.register_token;
+    if token.is_empty() {
+        return;
+    }
+    let base = if settings.public_base_url.is_empty() {
+        format!("http://127.0.0.1:{}", settings.port)
+    } else {
+        settings.public_base_url
     };
-    let token = match env::var("POLYGLOT_REGISTER_TOKEN") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
-    let base = env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("http://127.0.0.1:{port}"));
     let body = json!({
         "language": LANGUAGE,
         "language_version": LANGUAGE_VERSION,
@@ -756,19 +780,91 @@ impl From<deadpool_postgres::PoolError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::thread;
+
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
     use http_body_util::BodyExt;
-    use std::sync::{Mutex, MutexGuard};
+    use tokio::sync::{Mutex, MutexGuard};
     use tower::ServiceExt;
 
-    fn test_guard() -> MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    async fn test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::const_new(());
+        LOCK.lock().await
     }
 
     fn src() -> &'static str {
         include_str!("main.rs")
+    }
+
+    fn repo_file(rel: &str) -> String {
+        std::fs::read_to_string(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel))
+            .unwrap_or_else(|err| panic!("read {rel}: {err}"))
+    }
+
+    fn gitea_jobs(yaml: &str) -> HashMap<String, String> {
+        let rest = yaml
+            .split_once("\njobs:\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        let mut jobs = HashMap::new();
+        let mut current: Option<String> = None;
+        let mut buf = String::new();
+        for line in rest.lines() {
+            if let Some(name) = line.strip_prefix("  ") {
+                if !name.starts_with(' ') && !name.starts_with('#') && name.ends_with(':') {
+                    if let Some(cur) = current.take() {
+                        jobs.insert(cur, std::mem::take(&mut buf));
+                    }
+                    current = Some(name.trim_end_matches(':').to_string());
+                    continue;
+                }
+            }
+            if current.is_some() {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        if let Some(cur) = current {
+            jobs.insert(cur, buf);
+        }
+        jobs
+    }
+
+    fn job_needs(body: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut in_list = false;
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("needs:") {
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    in_list = true;
+                    continue;
+                }
+                if rest.starts_with('[') {
+                    for item in rest.trim_matches(|c| c == '[' || c == ']').split(',') {
+                        let item = item.trim();
+                        if !item.is_empty() {
+                            out.push(item.to_string());
+                        }
+                    }
+                } else {
+                    out.push(rest.to_string());
+                }
+                in_list = false;
+                continue;
+            }
+            if in_list {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    out.push(item.trim().to_string());
+                } else if !trimmed.is_empty() && !line.starts_with("      ") {
+                    in_list = false;
+                }
+            }
+        }
+        out
     }
 
     fn assert_years_desc(speakers: &[Value], label: &str) {
@@ -814,7 +910,7 @@ mod tests {
             "single-worker tokio runtime"
         );
         assert!(src().contains("max_size(4)"), "pool sized for 1 CPU");
-        let reg = src().split("async fn register(").nth(1).unwrap_or("");
+        let reg = fn_body(src(), "async fn register(");
         assert!(
             !reg.contains("db_query("),
             "register-once does not run catalog SQL"
@@ -827,6 +923,46 @@ mod tests {
             !reg.contains("pool.get("),
             "register-once does not check out a connection"
         );
+        let boot_body = fn_body(src(), "async fn boot(");
+        let bind_at = boot_body
+            .find("TcpListener::bind")
+            .expect("boot binds the listener");
+        let serve_at = boot_body.find("axum::serve").expect("boot serves");
+        let prewarm_at = boot_body
+            .find("prewarm_pool(")
+            .expect("boot warms the pool");
+        assert!(
+            bind_at < prewarm_at && prewarm_at < serve_at,
+            "bind, then spawn warmup, then serve"
+        );
+        let startup = &boot_body[bind_at..serve_at];
+        assert!(
+            startup.contains("spawn(async move"),
+            "warmup must be spawned so accept is not blocked on Postgres"
+        );
+        assert!(
+            startup.contains("spawn(register"),
+            "registration must be spawned so accept is not blocked on the CMS"
+        );
+    }
+
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let rest = src.split_once(sig).map(|(_, rest)| rest).unwrap_or("");
+        let start = rest.find('{').unwrap_or(0);
+        let mut depth = 0i32;
+        for (i, b) in rest[start..].bytes().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[start..=start + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        &rest[start..]
     }
 
     #[test]
@@ -841,9 +977,403 @@ mod tests {
         assert!(!is_fly_pg_host("127.0.0.1"));
     }
 
+    #[test]
+    fn precommit_and_gitea_wire_five_checks() {
+        let precommit = repo_file(".pre-commit-config.yaml");
+        let workflow = repo_file(".gitea/workflows/precommit.yml");
+        let makefile = repo_file("Makefile");
+        let hook = repo_file(".githooks/pre-commit");
+        let combined = format!("{precommit}\n{makefile}\n{workflow}\n{hook}");
+
+        assert!(
+            combined.contains("cargo test"),
+            "tests must invoke cargo test"
+        );
+        assert!(
+            combined.contains("clippy"),
+            "static analysis must invoke clippy"
+        );
+        assert!(
+            combined.contains("cargo audit"),
+            "lockfile scan must invoke cargo audit"
+        );
+        assert!(
+            combined.contains("gitleaks"),
+            "secret scan must invoke gitleaks"
+        );
+        assert!(
+            combined.contains("cargo fmt"),
+            "style check must invoke cargo fmt"
+        );
+        assert!(
+            precommit.contains("gitleaks"),
+            "pre-commit must run gitleaks as the secret scanner"
+        );
+        assert!(
+            workflow.contains("gitleaks"),
+            "Gitea workflow must run gitleaks as the secret scanner"
+        );
+        for id in [
+            "id: fmt",
+            "id: clippy",
+            "id: local-tests",
+            "id: audit",
+            "id: gitleaks",
+        ] {
+            assert!(precommit.contains(id), "pre-commit missing {id}");
+        }
+
+        let jobs = gitea_jobs(&workflow);
+        let checks = ["test", "clippy", "audit", "gitleaks", "fmt"];
+        let clone_cmd = r#"git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" ."#;
+        for name in checks {
+            assert!(
+                jobs.contains_key(name),
+                "Gitea workflow missing distinct job {name}; jobs={:?}",
+                jobs.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            jobs.contains_key("prep"),
+            "Gitea workflow missing prep job; jobs={:?}",
+            jobs.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            jobs.len(),
+            checks.len() + 1,
+            "expected prep plus one Gitea job per check, got {:?}",
+            jobs.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !workflow.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed == "git init"
+                    || trimmed.starts_with("git init ")
+                    || trimmed.starts_with("- run: git init")
+            }),
+            "workflow must not git init"
+        );
+        assert!(
+            !workflow.contains("git config --global init.defaultBranch"),
+            "workflow must not set init.defaultBranch"
+        );
+        assert!(
+            workflow.contains("cancel-in-progress: true"),
+            "outdated precommit runs must be cancelled"
+        );
+
+        let prep = jobs.get("prep").expect("prep job body");
+        assert!(
+            job_needs(prep).is_empty(),
+            "prep must not wait on a check job"
+        );
+        assert!(
+            prep.contains(clone_cmd),
+            "prep must clone the job workspace without git init"
+        );
+        assert!(
+            prep.contains(r#"git fetch --depth 1 origin "${GITHUB_SHA}""#),
+            "prep must fetch the SHA under test"
+        );
+        assert!(
+            prep.contains("missing job token for git fetch"),
+            "prep must fail closed if the job token is missing"
+        );
+        assert!(
+            prep.contains("rustup component add clippy"),
+            "prep must install clippy; rust: bookworm images ship rustup profile minimal"
+        );
+        assert!(
+            prep.contains("rustup component add") && prep.contains("rustfmt"),
+            "prep must install rustfmt; rust: bookworm images ship rustup profile minimal"
+        );
+        assert!(
+            prep.contains("cargo install cargo-audit"),
+            "prep must install cargo-audit"
+        );
+        assert!(prep.contains("gitleaks"), "prep must install gitleaks");
+        assert!(
+            prep.contains("tar -czf /tmp/prep-workspace.tar.gz"),
+            "prep must pack the workspace"
+        );
+        assert!(
+            prep.contains("--exclude=./.git"),
+            "must not exclude deps/*/.git of git cargo deps"
+        );
+        assert!(
+            !prep.contains("--exclude=.git\n") && !prep.contains("--exclude=.git "),
+            "bare --exclude=.git would strip nested git dirs"
+        );
+        assert!(
+            prep.contains("mv /tmp/prep-workspace.tar.gz prep-workspace.tar.gz"),
+            "prep must move the tarball into the upload path"
+        );
+        assert!(
+            prep.contains("actions/upload-artifact@v3"),
+            "prep must upload the workspace artifact"
+        );
+        assert!(
+            prep.contains("name: prep-workspace"),
+            "prep must upload prep-workspace"
+        );
+        assert!(
+            prep.contains(".ci-home/bin"),
+            "prep must pack extra toolchain bins so they survive a fresh container"
+        );
+        for name in [
+            "cargo-clippy",
+            "clippy-driver",
+            "cargo-fmt",
+            "rustfmt",
+            "cargo-audit",
+            "gitleaks",
+        ] {
+            assert!(
+                prep.contains(name),
+                "prep must pack {name} into the workspace"
+            );
+        }
+
+        let check_cmds = [
+            ("test", "cargo test"),
+            ("clippy", "cargo clippy"),
+            ("audit", "cargo audit"),
+            ("gitleaks", "gitleaks detect"),
+            ("fmt", "cargo fmt"),
+        ];
+        for name in checks {
+            let body = jobs.get(name).expect("job body");
+            let deps = job_needs(body);
+            assert!(
+                deps.iter().any(|dep| dep == "prep"),
+                "job {name} must wait for prep; needs={deps:?}"
+            );
+            for dep in &deps {
+                assert!(
+                    !checks.contains(&dep.as_str()),
+                    "job {name} needs {dep} would serialize the five checks"
+                );
+            }
+            assert!(
+                body.contains("actions/download-artifact@v3"),
+                "{name} must download the prep artifact"
+            );
+            assert!(
+                body.contains("name: prep-workspace"),
+                "{name} must restore prep-workspace"
+            );
+            assert!(
+                body.contains("prep-workspace.tar.gz"),
+                "{name} must unpack the prep workspace"
+            );
+            assert!(
+                body.contains("scripts/ci-restore.sh"),
+                "{name} must restore packed tools via scripts/ci-restore.sh"
+            );
+            assert!(
+                !body.contains("cp -a .ci-home/bin/. /usr/local/cargo/bin/"),
+                "{name} must not copy rustc-driver ELFs over rustup shims in cargo/bin"
+            );
+            assert!(
+                !body.contains(clone_cmd),
+                "{name} must not clone; restore the prep workspace"
+            );
+            assert!(
+                !body.contains("missing job token for git fetch"),
+                "{name} must not token-clone"
+            );
+            assert!(
+                !body.contains("rustup component add"),
+                "{name} must not rustup component add; restore tools from prep"
+            );
+            assert!(
+                !body.contains("cargo install cargo-audit"),
+                "{name} must not install cargo-audit; restore tools from prep"
+            );
+            assert!(
+                !body.contains("gitleaks_8.30.1"),
+                "{name} must not download gitleaks; restore tools from prep"
+            );
+        }
+        assert!(
+            jobs["test"].contains("postgres:16-alpine"),
+            "test job must supply Postgres 16"
+        );
+        assert!(
+            jobs["test"].contains("DATABASE_URL"),
+            "test job must set DATABASE_URL for live listing tests"
+        );
+        for name in checks {
+            let body = &jobs[name];
+            for (other, cmd) in check_cmds {
+                if other == name {
+                    assert!(body.contains(cmd), "job {name} must run {cmd}");
+                } else {
+                    assert!(
+                        !body.contains(cmd),
+                        "job {name} also runs {cmd}; each check must be its own Gitea job"
+                    );
+                }
+            }
+        }
+        for (check, cmd) in check_cmds {
+            assert!(
+                !prep.contains(cmd),
+                "prep also runs {cmd}; keep prepare logic out of the checks"
+            );
+            let matching = jobs
+                .iter()
+                .filter(|(_, body)| body.contains(cmd))
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching,
+                vec![check],
+                "{cmd} must be the check in exactly one job, got {matching:?}"
+            );
+        }
+
+        let restore = repo_file("scripts/ci-restore.sh");
+        assert!(
+            restore.contains("rustc --print sysroot"),
+            "restore must place rustc-linked tools in the rustc sysroot"
+        );
+        assert!(
+            restore.contains(r#"$sysroot/bin"#),
+            "restore must copy clippy/rustfmt into sysroot/bin so RUNPATH $ORIGIN/../lib resolves"
+        );
+        for name in ["cargo-clippy", "clippy-driver", "cargo-fmt", "rustfmt"] {
+            assert!(
+                restore.contains(name),
+                "restore must install {name} into the sysroot"
+            );
+        }
+        assert!(
+            !restore.contains("cp -a .ci-home/bin/. /usr/local/cargo/bin/"),
+            "restore must not copy rustc-driver ELFs over rustup shims"
+        );
+        assert!(
+            restore.contains("cargo-audit") && restore.contains("CARGO_HOME"),
+            "restore may copy cargo-audit into cargo/bin; it has no librustc_driver RUNPATH"
+        );
+    }
+
+    #[test]
+    fn ci_restore_places_rustc_driver_bins_in_sysroot_not_cargo_bin() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!(
+            "carolina-ci-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let ws = root.join("ws");
+        let packed = ws.join(".ci-home/bin");
+        let sysroot = root.join("sysroot");
+        let cargo_home = root.join("cargo");
+        let cargo_bin = cargo_home.join("bin");
+        let local_bin = root.join("local-bin");
+        let stub_bin = root.join("stub-bin");
+        let github_path = root.join("github-path");
+        fs::create_dir_all(&packed).unwrap();
+        fs::create_dir_all(&cargo_bin).unwrap();
+        fs::create_dir_all(&local_bin).unwrap();
+        fs::create_dir_all(&stub_bin).unwrap();
+        fs::write(cargo_bin.join("cargo-clippy"), "rustup-shim\n").unwrap();
+        for name in [
+            "cargo-clippy",
+            "clippy-driver",
+            "cargo-fmt",
+            "rustfmt",
+            "cargo-audit",
+            "gitleaks",
+        ] {
+            let path = packed.join(name);
+            fs::write(&path, format!("packed-{name}\n")).unwrap();
+            let mut packed_perm = fs::metadata(&path).unwrap().permissions();
+            packed_perm.set_mode(0o755);
+            fs::set_permissions(&path, packed_perm).unwrap();
+        }
+        let rustc_stub = stub_bin.join("rustc");
+        fs::write(
+            &rustc_stub,
+            format!("#!/bin/sh\n[ \"$1\" = --print ] && [ \"$2\" = sysroot ] && echo '{}' && exit 0\nexit 1\n", sysroot.display()),
+        )
+        .unwrap();
+        let mut perm = fs::metadata(&rustc_stub).unwrap().permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&rustc_stub, perm).unwrap();
+
+        let script = format!("{}/scripts/ci-restore.sh", env!("CARGO_MANIFEST_DIR"));
+        let path = format!("{}:/usr/bin:/bin", stub_bin.display());
+        let status = Command::new("sh")
+            .arg(&script)
+            .current_dir(&ws)
+            .env("CI_RESTORE_LOCAL_BIN", &local_bin)
+            .env("CARGO_HOME", &cargo_home)
+            .env("GITHUB_PATH", &github_path)
+            .env("PATH", &path)
+            .status()
+            .expect("run ci-restore.sh");
+        assert!(status.success(), "ci-restore.sh failed: {status}");
+
+        for name in ["cargo-clippy", "clippy-driver", "cargo-fmt", "rustfmt"] {
+            let dest = sysroot.join("bin").join(name);
+            let body = fs::read_to_string(&dest)
+                .unwrap_or_else(|err| panic!("read {}: {err}", dest.display()));
+            assert_eq!(
+                body,
+                format!("packed-{name}\n"),
+                "{name} must land in sysroot/bin"
+            );
+            let cargo_copy = cargo_bin.join(name);
+            if name == "cargo-clippy" {
+                assert_eq!(
+                    fs::read_to_string(&cargo_copy).unwrap(),
+                    "rustup-shim\n",
+                    "must not overwrite rustup shim in cargo/bin"
+                );
+            } else {
+                assert!(
+                    !cargo_copy.exists(),
+                    "{name} must not be copied over rustup shims in cargo/bin"
+                );
+            }
+            let wrapper = fs::read_to_string(local_bin.join(name)).unwrap();
+            assert!(
+                wrapper.contains(&format!("{}/bin/{name}", sysroot.display())),
+                "{name} PATH wrapper must exec the sysroot ELF"
+            );
+            assert!(
+                wrapper.contains("exec "),
+                "{name} wrapper must exec so RUNPATH $ORIGIN is sysroot/bin"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(cargo_bin.join("cargo-audit")).unwrap(),
+            "packed-cargo-audit\n"
+        );
+        assert_eq!(
+            fs::read_to_string(local_bin.join("gitleaks")).unwrap(),
+            "packed-gitleaks\n"
+        );
+        let github_path_body = fs::read_to_string(&github_path).unwrap();
+        assert!(
+            github_path_body.contains(&format!("{}/bin", sysroot.display())),
+            "GITHUB_PATH must prepend sysroot/bin, got {github_path_body:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn health_does_not_query_or_connect() {
-        let _guard = test_guard();
+        let _guard = test_guard().await;
         reset_counts();
         let pool = db_pool(&test_db_url()).expect("open pool for state");
         let boot = CONNECT_COUNT.load(Ordering::SeqCst);
@@ -858,9 +1388,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-polyglot-language")
+                .and_then(|v| v.to_str().ok()),
+            Some("Rust")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-polyglot-framework")
+                .and_then(|v| v.to_str().ok()),
+            Some("axum")
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["ok"], true);
+        assert_eq!(v, json!({ "ok": true }));
         assert_eq!(SQL_COUNT.load(Ordering::SeqCst), 0, "/health ran SQL");
         assert_eq!(
             CONNECT_COUNT.load(Ordering::SeqCst),
@@ -869,77 +1413,696 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn year_listing_sql_bounded_and_years_desc() {
-        let _guard = test_guard();
-        reset_counts();
-        let pool = db_pool(&test_db_url()).expect("live carolina_dev pool");
-        let boot = CONNECT_COUNT.load(Ordering::SeqCst);
-        SQL_COUNT.store(0, Ordering::SeqCst);
-        let app = router(AppState { pool: pool.clone() });
+    const CATALOG_SQL: &str = r#"
+CREATE TABLE years_src (
+    year bigint PRIMARY KEY,
+    slug text NOT NULL,
+    name text NOT NULL,
+    status text NOT NULL
+);
+CREATE TABLE speakers_src (
+    slug text PRIMARY KEY,
+    first_name text NOT NULL,
+    last_name text NOT NULL,
+    name text NOT NULL,
+    tagline text,
+    bio text,
+    company text,
+    location text,
+    photo_path text,
+    twitter_url text,
+    linkedin_url text,
+    website_url text,
+    github_url text,
+    featured boolean NOT NULL
+);
+CREATE TABLE talks_src (
+    slug text PRIMARY KEY,
+    title text NOT NULL,
+    description text,
+    format text,
+    youtube_id text,
+    year bigint NOT NULL,
+    speaker_slug text NOT NULL,
+    languages text[] NOT NULL,
+    topics text[] NOT NULL
+);
+CREATE TABLE sponsors_src (
+    slug text PRIMARY KEY,
+    name text NOT NULL,
+    website text,
+    logo_path text,
+    description text,
+    twitter_url text,
+    linkedin_url text,
+    youtube_url text,
+    instagram_url text,
+    facebook_url text
+);
+CREATE TABLE sponsorships_src (
+    sponsor_slug text NOT NULL,
+    year bigint NOT NULL,
+    tier text,
+    blurb text,
+    featured boolean NOT NULL
+);
+CREATE VIEW v1_years AS
+    SELECT year, slug, name, status FROM years_src;
+CREATE VIEW v1_speakers AS
+    SELECT slug, first_name, last_name, name, tagline, bio, company, location,
+           photo_path, twitter_url, linkedin_url, website_url, github_url, featured
+    FROM speakers_src;
+CREATE VIEW v1_talks AS
+    SELECT slug, title, description, format, youtube_id, year, speaker_slug, languages, topics
+    FROM talks_src;
+CREATE VIEW v1_sponsors AS
+    SELECT slug, name, website, logo_path, description,
+           twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url
+    FROM sponsors_src;
+CREATE VIEW v1_sponsorships AS
+    SELECT sponsor_slug, year, tier, blurb, featured FROM sponsorships_src;
+CREATE VIEW v1_year_sponsors AS
+    SELECT s.slug, s.name, s.website, s.logo_path, s.description,
+           p.blurb, p.tier, p.featured, p.year,
+           s.twitter_url, s.linkedin_url, s.youtube_url, s.instagram_url, s.facebook_url
+    FROM sponsors_src s
+    JOIN sponsorships_src p ON p.sponsor_slug = s.slug;
+
+INSERT INTO years_src (year, slug, name, status) VALUES
+    (2026, '2026', 'Carolina Codes 2026', 'announced'),
+    (2025, '2025', 'Carolina Codes 2025', 'completed'),
+    (2024, '2024', 'Carolina Codes 2024', 'completed');
+
+INSERT INTO speakers_src (
+    slug, first_name, last_name, name, tagline, bio, company, location,
+    photo_path, twitter_url, linkedin_url, website_url, github_url, featured
+) VALUES
+    ('ada', 'Ada', 'Lovelace', 'Ada Lovelace', 'Analyst', 'First programmer', 'Analytical Engines', 'London',
+     '/photos/ada.jpg', NULL, NULL, 'https://ada.example', 'https://github.com/ada', true),
+    ('grace', 'Grace', 'Hopper', 'Grace Hopper', NULL, NULL, 'Navy', 'Arlington',
+     NULL, NULL, NULL, NULL, NULL, false),
+    ('linus', 'Linus', 'Torvalds', 'Linus Torvalds', 'Kernel', 'Git and Linux', NULL, 'Portland',
+     NULL, NULL, NULL, NULL, 'https://github.com/torvalds', false),
+    ('edsger', 'Edsger', 'Dijkstra', 'Edsger Dijkstra', 'EWD', NULL, NULL, 'Eindhoven',
+     NULL, NULL, NULL, NULL, NULL, false);
+
+INSERT INTO talks_src (
+    slug, title, description, format, youtube_id, year, speaker_slug, languages, topics
+) VALUES
+    ('ada-notes-2026', 'Notes on the engine', 'A talk', 'talk', 'yt-ada-2026', 2026, 'ada',
+     ARRAY['rust']::text[], ARRAY['compilers','types']::text[]),
+    ('ada-notes-2025', 'Notes on the engine again', NULL, 'talk', NULL, 2025, 'ada',
+     ARRAY['rust','sql']::text[], ARRAY['databases']::text[]),
+    ('grace-cobol-2026', 'Compilers aboard', 'COBOL', 'talk', NULL, 2026, 'grace',
+     ARRAY['cobol']::text[], ARRAY['compilers']::text[]),
+    ('linus-git-2026', 'Patches', NULL, 'talk', 'yt-linus', 2026, 'linus',
+     ARRAY['c']::text[], ARRAY['vcs']::text[]),
+    ('edsger-ewd-2024', 'Go to considered harmful', NULL, 'talk', NULL, 2024, 'edsger',
+     ARRAY[]::text[], ARRAY['style']::text[]);
+
+INSERT INTO sponsors_src (
+    slug, name, website, logo_path, description,
+    twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url
+) VALUES
+    ('acme', 'Acme Corp', 'https://acme.example', '/logos/acme.png', 'Roadrunners',
+     NULL, NULL, NULL, NULL, NULL),
+    ('globex', 'Globex', 'https://globex.example', NULL, NULL,
+     NULL, NULL, NULL, NULL, NULL);
+
+INSERT INTO sponsorships_src (sponsor_slug, year, tier, blurb, featured) VALUES
+    ('acme', 2026, 'gold', 'Premier', true),
+    ('acme', 2025, 'silver', 'Returning', false),
+    ('globex', 2026, 'bronze', NULL, false);
+"#;
+
+    struct IsolatedCatalog {
+        dbname: String,
+        admin_url: String,
+        pool: Option<Pool>,
+    }
+
+    impl IsolatedCatalog {
+        async fn open() -> Self {
+            let dbname = fresh_dbname();
+            let admin_url = with_dbname(&test_db_url(), "postgres");
+            let admin = connect_pg(&admin_url).await;
+            admin
+                .batch_execute(&format!("CREATE DATABASE {dbname}"))
+                .await
+                .unwrap_or_else(|err| panic!("create isolated database {dbname}: {err}"));
+            drop(admin);
+
+            let catalog_url = with_dbname(&test_db_url(), &dbname);
+            let client = connect_pg(&catalog_url).await;
+            client
+                .batch_execute(CATALOG_SQL)
+                .await
+                .unwrap_or_else(|err| panic!("seed {dbname}: {err}"));
+            let rows = client
+                .query(
+                    "SELECT c.relname::text, c.relkind::text \
+                     FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = 'public' AND c.relname LIKE 'v1\\_%' ESCAPE '\\' \
+                     ORDER BY c.relname",
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|err| panic!("list views in {dbname}: {err}"));
+            let mut seen = Vec::new();
+            for row in &rows {
+                let name: String = row.get(0);
+                let kind: String = row.get(1);
+                assert_eq!(kind, "v", "{name} must be a view, relkind={kind}");
+                seen.push(name);
+            }
+            for name in [
+                "v1_speakers",
+                "v1_sponsors",
+                "v1_sponsorships",
+                "v1_talks",
+                "v1_year_sponsors",
+                "v1_years",
+            ] {
+                assert!(
+                    seen.iter().any(|got| got == name),
+                    "missing view {name} in {seen:?}"
+                );
+            }
+            drop(client);
+            let pool = db_pool(&catalog_url).unwrap_or_else(|err| panic!("pool {dbname}: {err}"));
+            Self {
+                dbname,
+                admin_url,
+                pool: Some(pool),
+            }
+        }
+
+        fn pool(&self) -> Pool {
+            self.pool.clone().expect("isolated catalog pool")
+        }
+    }
+
+    impl Drop for IsolatedCatalog {
+        fn drop(&mut self) {
+            self.pool.take();
+            let dbname = std::mem::take(&mut self.dbname);
+            if dbname.is_empty() {
+                return;
+            }
+            let admin_url = self.admin_url.clone();
+            let _ = thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("cleanup runtime");
+                rt.block_on(async move {
+                    let Ok(cfg) = postgres_config(&admin_url) else {
+                        return;
+                    };
+                    let Ok((client, conn)) = cfg.connect(NoTls).await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    let _ = client
+                        .batch_execute(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
+                        .await;
+                });
+            })
+            .join();
+        }
+    }
+
+    async fn with_isolated_catalog<F, Fut>(body: F)
+    where
+        F: FnOnce(Pool) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let base = test_db_url();
+        let before_rels = relation_names(&base).await;
+        let admin_url = with_dbname(&base, "postgres");
+        let before_dbs = database_names(&admin_url).await;
+        let catalog = IsolatedCatalog::open().await;
+        let pool = catalog.pool();
+        body(pool).await;
+        drop(catalog);
+        let after_dbs = database_names(&admin_url).await;
+        assert_eq!(
+            before_dbs, after_dbs,
+            "catalog fixture must not drop or leave databases on the shared server"
+        );
+        if let Some(before) = before_rels {
+            let after = relation_names(&base)
+                .await
+                .expect("DATABASE_URL database disappeared");
+            assert_eq!(
+                before, after,
+                "catalog fixture must not alter relations in the DATABASE_URL database"
+            );
+        }
+    }
+
+    async fn connect_pg(url: &str) -> tokio_postgres::Client {
+        let cfg = postgres_config(url).unwrap_or_else(|err| panic!("postgres config: {err}"));
+        let (client, conn) = cfg.connect(NoTls).await.unwrap_or_else(|err| {
+            panic!("Postgres is required for catalog tests and must not be skipped: {err:?}")
+        });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+    }
+
+    async fn database_names(admin_url: &str) -> Vec<String> {
+        let client = connect_pg(admin_url).await;
+        let rows = client
+            .query(
+                "SELECT datname::text FROM pg_database ORDER BY datname",
+                &[],
+            )
+            .await
+            .unwrap_or_else(|err| panic!("list databases: {err}"));
+        rows.iter().map(|row| row.get(0)).collect()
+    }
+
+    async fn relation_names(url: &str) -> Option<Vec<String>> {
+        let cfg = postgres_config(url).unwrap_or_else(|err| panic!("postgres config: {err}"));
+        match cfg.connect(NoTls).await {
+            Ok((client, conn)) => {
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let rows = client
+                    .query(
+                        "SELECT n.nspname || '.' || c.relname || ':' || c.relkind::text \
+                         FROM pg_class c \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                           AND c.relkind IN ('r', 'v', 'm', 'p') \
+                         ORDER BY 1",
+                        &[],
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("list relations: {err}"));
+                Some(rows.iter().map(|row| row.get(0)).collect())
+            }
+            Err(err) => {
+                let missing_db = err.as_db_error().is_some_and(|db| {
+                    db.code().code() == "3D000" || db.message().contains("does not exist")
+                });
+                if missing_db {
+                    None
+                } else {
+                    panic!(
+                        "Postgres is required for catalog tests and must not be skipped: {err:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    fn fresh_dbname() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let name = format!("ccrust_{}_{nanos}", std::process::id());
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "unexpected database name {name}"
+        );
+        name
+    }
+
+    fn with_dbname(url: &str, dbname: &str) -> String {
+        let (base, query) = match url.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (url, None),
+        };
+        let scheme = base.find("://").map(|i| i + 3).unwrap_or(0);
+        let path = base[scheme..]
+            .find('/')
+            .map(|rel| scheme + rel)
+            .unwrap_or(base.len());
+        let mut out = format!("{}/{dbname}", base[..path].trim_end_matches('/'));
+        if let Some(query) = query {
+            out.push('?');
+            out.push_str(query);
+        }
+        out
+    }
+
+    async fn oneshot_json(app: &Router, uri: &str) -> (StatusCode, HeaderMap, Value) {
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/speakers?year=2026")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
-            .unwrap();
+            .unwrap_or_else(|err| panic!("{uri}: {err}"));
         let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let payload: Value = serde_json::from_slice(&body).expect("json");
-        let speakers = payload["data"].as_array().cloned().unwrap_or_default();
-        let sql = SQL_COUNT.load(Ordering::SeqCst);
-        eprintln!(
-            "year list status={} sql={} speakers={} connects={}",
-            status.as_u16(),
-            sql,
-            speakers.len(),
-            CONNECT_COUNT.load(Ordering::SeqCst)
-        );
-        assert_eq!(status, StatusCode::OK, "live year listing {}", payload);
-        assert!(speakers.len() >= 3, "year listing returns N>=3 speakers");
-        assert!(sql > 0, "listing runs SQL through shipped query wrapper");
-        assert!(
-            sql < 2 * speakers.len() as u64,
-            "SQL count {sql} grew like 2N for N={}",
-            speakers.len()
-        );
-        assert!(
-            sql <= 4,
-            "year listing SQL {sql} should be speakers+talks+years"
-        );
-        assert_years_desc(&speakers, "handler");
-        assert_eq!(
-            CONNECT_COUNT.load(Ordering::SeqCst),
-            boot,
-            "listing opened a new session"
-        );
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|err| panic!("{uri}: {err}; body={bytes:?}"));
+        (status, headers, value)
+    }
 
-        let client = pool.get().await.expect("checkout");
-        let rows = list_speakers(&client, Some(2026))
-            .await
-            .expect("list_speakers");
-        assert_years_desc(&rows, "list_speakers");
-
-        SQL_COUNT.store(0, Ordering::SeqCst);
-        let second = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/speakers?year=2026")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+    fn assert_polyglot(headers: &HeaderMap, uri: &str) {
+        let lang = headers
+            .get("x-polyglot-language")
+            .unwrap_or_else(|| panic!("{uri} missing X-Polyglot-Language: {headers:?}"))
+            .to_str()
             .unwrap();
-        assert_eq!(second.status(), StatusCode::OK);
+        let framework = headers
+            .get("x-polyglot-framework")
+            .unwrap_or_else(|| panic!("{uri} missing X-Polyglot-Framework: {headers:?}"))
+            .to_str()
+            .unwrap();
+        assert_eq!(lang, "Rust", "{uri}");
+        assert_eq!(framework, "axum", "{uri}");
+    }
+
+    fn data_array(body: &Value) -> &Vec<Value> {
+        body.get("data")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("expected data array in {body}"))
+    }
+
+    fn data_object(body: &Value) -> &Value {
+        let data = body
+            .get("data")
+            .unwrap_or_else(|| panic!("expected data in {body}"));
+        assert!(data.is_object(), "expected data object in {body}");
+        data
+    }
+
+    fn years_of(value: &Value, key: &str) -> Vec<i64> {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("missing {key} in {value}"))
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect()
+    }
+
+    fn by_slug<'a>(rows: &'a [Value], slug: &str) -> &'a Value {
+        rows.iter()
+            .find(|row| row["slug"] == slug)
+            .unwrap_or_else(|| panic!("missing {slug}"))
+    }
+
+    #[test]
+    fn with_dbname_rewrites_only_the_database() {
         assert_eq!(
-            CONNECT_COUNT.load(Ordering::SeqCst),
-            boot,
-            "second catalog request opened a new session"
+            with_dbname(
+                "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev",
+                "postgres"
+            ),
+            "postgres://postgres:postgres@127.0.0.1:5432/postgres"
         );
+        assert_eq!(
+            with_dbname(
+                "postgres://postgres:postgres@postgres:5432/carolina_dev?sslmode=disable",
+                "ccrust_1"
+            ),
+            "postgres://postgres:postgres@postgres:5432/ccrust_1?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn catalog_sql_targets_v1_views_only() {
+        let queries = [
+            SQL_YEARS,
+            SQL_SPEAKERS,
+            SQL_SPEAKERS_FOR_YEAR,
+            SQL_SPEAKER_BY_SLUG,
+            SQL_TALKS_FOR_YEAR,
+            SQL_TALKS_BY_SLUG,
+            SQL_TALKS_BY_SLUG_YEAR,
+            SQL_TALK_YEARS,
+            SQL_YEARS_FOR_SLUGS,
+            SQL_YEAR_SPONSORS,
+            SQL_YEAR_SPONSOR,
+            SQL_SPONSORS,
+            SQL_SPONSOR_BY_SLUG,
+            SQL_SPONSORSHIPS,
+            SQL_SPONSOR_YEARS,
+        ];
+        for sql in queries {
+            let lower = sql.to_ascii_lowercase();
+            assert!(lower.contains("v1_"), "{sql}");
+            assert!(!lower.contains("ash"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn fly_idle_is_not_stop_from_zero_and_image_is_locked() {
+        let fly = repo_file("fly.toml");
+        let stops = fly.contains("auto_stop_machines = \"stop\"");
+        let min_zero = fly
+            .lines()
+            .any(|line| line.trim() == "min_machines_running = 0");
+        assert!(
+            !(stops && min_zero),
+            "fly.toml must not stop machines with min_machines_running = 0"
+        );
+        assert!(
+            fly.contains("auto_stop_machines = \"suspend\""),
+            "256mb machine must suspend so idle resume is not a full boot"
+        );
+        assert!(
+            fly.contains("memory = \"256mb\""),
+            "suspend stays within Fly's memory limit"
+        );
+        assert!(fly.contains("auto_start_machines = true"));
+        assert!(fly.contains("method = \"GET\""));
+        assert!(fly.contains("path = \"/health\""));
+
+        let docker = repo_file("Dockerfile");
+        assert!(
+            !docker.contains("cargo build --release &&")
+                && !docker.contains("cargo build --release\n"),
+            "release builds must pass --locked"
+        );
+        assert_eq!(
+            docker.matches("cargo build --release --locked").count(),
+            2,
+            "dependency warmup and the final build both use --locked"
+        );
+        let runtime = docker
+            .rsplit_once("\nFROM ")
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        assert!(
+            runtime.starts_with("debian:bookworm-slim"),
+            "runtime stage must not ship the Rust toolchain: {runtime}"
+        );
+        assert!(runtime.contains("USER nobody"));
+        assert!(!runtime.contains("rustup"));
+        assert!(!runtime.contains("cargo"));
+        assert!(!runtime.contains("rustc"));
+    }
+
+    #[test]
+    fn toolchain_matches_gitea_image_and_local_rustc() {
+        let pinned = env!("RUSTC_VERSION");
+        let toolchain = repo_file("rust-toolchain.toml");
+        assert!(
+            toolchain.contains(&format!("channel = \"{pinned}\"")),
+            "rust-toolchain.toml must pin the compiler running these tests ({pinned})"
+        );
+        let image = format!("docker.io/library/rust:{pinned}-bookworm");
+        let workflow = repo_file(".gitea/workflows/precommit.yml");
+        assert_eq!(
+            workflow.matches(image.as_str()).count(),
+            5,
+            "prep, test, clippy, audit, and fmt must use {image}"
+        );
+        let docker = repo_file("Dockerfile");
+        assert!(
+            docker.contains(&format!("FROM rust:{pinned}-bookworm")),
+            "release build image must match local rustc {pinned}"
+        );
+    }
+
+    #[tokio::test]
+    async fn year_listing_sql_bounded_and_years_desc() {
+        let _guard = test_guard().await;
+        with_isolated_catalog(|pool| async move {
+            reset_counts();
+            let boot = CONNECT_COUNT.load(Ordering::SeqCst);
+            let app = router(AppState { pool: pool.clone() });
+            let (status, headers, payload) = oneshot_json(&app, "/v1/speakers?year=2026").await;
+            let speakers = data_array(&payload).clone();
+            let sql = SQL_COUNT.load(Ordering::SeqCst);
+            assert_eq!(status, StatusCode::OK, "live year listing {payload}");
+            assert_polyglot(&headers, "/v1/speakers?year=2026");
+            assert!(speakers.len() >= 3, "year listing returns N>=3 speakers");
+            assert!(sql > 0, "listing runs SQL through shipped query wrapper");
+            assert!(
+                sql < 2 * speakers.len() as u64,
+                "SQL count {sql} grew like 2N for N={}",
+                speakers.len()
+            );
+            assert!(
+                sql <= 4,
+                "year listing SQL {sql} should be speakers+talks+years"
+            );
+            assert_years_desc(&speakers, "handler");
+            assert_eq!(
+                CONNECT_COUNT.load(Ordering::SeqCst),
+                boot,
+                "listing opened a new session"
+            );
+
+            let client = pool.get().await.expect("checkout");
+            let rows = list_speakers(&client, Some(2026))
+                .await
+                .expect("list_speakers");
+            assert_years_desc(&rows, "list_speakers");
+
+            SQL_COUNT.store(0, Ordering::SeqCst);
+            let (status, _, _) = oneshot_json(&app, "/v1/speakers?year=2026").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                CONNECT_COUNT.load(Ordering::SeqCst),
+                boot,
+                "second catalog request opened a new session"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn published_routes_against_isolated_v1_views() {
+        let _guard = test_guard().await;
+        with_isolated_catalog(|pool| async move {
+            reset_counts();
+            let app = router(AppState { pool });
+
+            let (status, headers, body) = oneshot_json(&app, "/").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_polyglot(&headers, "/");
+            assert_eq!(body["language"], "Rust");
+            assert_eq!(body["framework"], "axum");
+
+            let connects = CONNECT_COUNT.load(Ordering::SeqCst);
+            SQL_COUNT.store(0, Ordering::SeqCst);
+            let (status, headers, body) = oneshot_json(&app, "/health").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_polyglot(&headers, "/health");
+            assert_eq!(body, json!({ "ok": true }));
+            assert_eq!(SQL_COUNT.load(Ordering::SeqCst), 0, "/health ran SQL");
+            assert_eq!(CONNECT_COUNT.load(Ordering::SeqCst), connects);
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/years").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/years");
+            assert_eq!(
+                body["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["year"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![2026, 2025, 2024]
+            );
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/speakers").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/speakers");
+            let speakers = data_array(&body);
+            assert_eq!(speakers.len(), 4);
+            assert_eq!(by_slug(speakers, "ada")["name"], "Ada Lovelace");
+            assert_eq!(by_slug(speakers, "ada")["tagline"], "Analyst");
+            assert!(by_slug(speakers, "grace")["tagline"].is_null());
+
+            reset_counts();
+            let connects = CONNECT_COUNT.load(Ordering::SeqCst);
+            let (status, headers, body) = oneshot_json(&app, "/v1/speakers?year=2026").await;
+            let sql = SQL_COUNT.load(Ordering::SeqCst);
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/speakers?year=2026");
+            let year_speakers = data_array(&body);
+            assert!(year_speakers.len() >= 3);
+            assert!(sql > 0 && sql <= 4, "year listing SQL {sql}");
+            assert_eq!(
+                CONNECT_COUNT.load(Ordering::SeqCst),
+                connects,
+                "year listing opened a new session"
+            );
+            assert_years_desc(year_speakers, "published year listing");
+            let ada = by_slug(year_speakers, "ada");
+            assert_eq!(ada["year"], 2026);
+            assert!(!ada["talks"].as_array().unwrap().is_empty());
+            assert!(ada["years"].as_array().unwrap().len() >= 2);
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/speakers/ada").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/speakers/ada");
+            let ada = data_object(&body);
+            assert_eq!(ada["slug"], "ada");
+            assert!(ada["talks"].as_array().unwrap().len() >= 2);
+            assert_eq!(years_of(ada, "years"), vec![2026, 2025]);
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/speakers/2026/ada").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/speakers/2026/ada");
+            let ada = data_object(&body);
+            assert_eq!(ada["year"], 2026);
+            assert!(!ada["talks"].as_array().unwrap().is_empty());
+            assert_eq!(years_of(ada, "other_years"), vec![2025]);
+            assert!(ada["languages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("rust")));
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/sponsors").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/sponsors");
+            assert_eq!(data_array(&body).len(), 2);
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/sponsors?year=2026").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/sponsors?year=2026");
+            let sponsors = data_array(&body);
+            assert_eq!(sponsors.len(), 2);
+            assert!(sponsors.iter().all(|row| row["year"] == 2026));
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/sponsors/acme").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/sponsors/acme");
+            let acme = data_object(&body);
+            assert_eq!(acme["slug"], "acme");
+            assert_eq!(acme["sponsorships"].as_array().unwrap().len(), 2);
+
+            let (status, headers, body) = oneshot_json(&app, "/v1/sponsors/2026/acme").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_polyglot(&headers, "/v1/sponsors/2026/acme");
+            let acme = data_object(&body);
+            assert_eq!(acme["year"], 2026);
+            assert_eq!(acme["tier"], "gold");
+            assert_eq!(years_of(acme, "other_years"), vec![2025]);
+
+            for path in [
+                "/v1/speakers/missing-speaker",
+                "/v1/sponsors/missing-sponsor",
+                "/v1/speakers/2026/missing-speaker",
+                "/v1/sponsors/2026/missing-sponsor",
+                "/v1/speakers/2019/ada",
+                "/not-a-route",
+            ] {
+                let (status, headers, body) = oneshot_json(&app, path).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{path} -> {body}");
+                assert_eq!(body["error"], "not_found", "{path}");
+                assert_polyglot(&headers, path);
+            }
+        })
+        .await;
     }
 
     fn test_db_url() -> String {

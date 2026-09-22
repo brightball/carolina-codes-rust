@@ -1,0 +1,180 @@
+# One Gitea Actions job per local check. Not a single combined job.
+# The five check jobs have no inter-check `needs`, so they run in parallel
+# after a shared prep job.
+#
+# act_runner starts a new container per job, so jobs cannot share a live
+# image. Host bind-mounts are also blocked (valid_volumes is empty). Prep
+# checks out GITHUB_SHA, installs clippy, rustfmt, cargo-audit, and
+# gitleaks once, then uploads a workspace tarball. Later checks restore
+# that artifact. Official rust:*-bookworm and debian:bookworm-slim have
+# no Node, so those jobs apt-get nodejs only to run the artifact action —
+# they do not clone or repeat the shared toolchain installs.
+#
+# Empty rust/debian image: clone GITHUB_SHA with the job token over
+# HTTPS. Gitea git HTTP returns 401 without the token. Do not git init
+# or set init.defaultBranch here.
+#
+# Official rust:*-bookworm images use rustup --profile minimal, so clippy
+# and rustfmt are not on the toolchain until `rustup component add`. Packed
+# clippy/rustfmt ELFs must be restored into $(rustc --print sysroot)/bin so
+# RUNPATH $ORIGIN/../lib finds librustc_driver. Do not copy them over rustup
+# shims in /usr/local/cargo/bin.
+name: precommit
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: precommit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/rust:1.98.1-bookworm
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl nodejs
+      - run: |
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+      - run: rustup component add clippy rustfmt
+      - run: cargo install cargo-audit --locked
+      - run: |
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xzf - -C /usr/local/bin gitleaks
+      - run: |
+          mkdir -p .ci-home/bin
+          sysroot="$(rustc --print sysroot)"
+          for name in cargo-clippy clippy-driver cargo-fmt rustfmt cargo-audit gitleaks; do
+            if [ -x "$sysroot/bin/$name" ]; then
+              cp "$sysroot/bin/$name" .ci-home/bin/
+            elif command -v "$name" >/dev/null 2>&1; then
+              cp "$(command -v "$name")" .ci-home/bin/
+            else
+              echo "missing tool $name" >&2
+              exit 1
+            fi
+          done
+          chmod -R a+x .ci-home/bin
+          tar -czf /tmp/prep-workspace.tar.gz \
+            --exclude=./.git \
+            .
+          mv /tmp/prep-workspace.tar.gz prep-workspace.tar.gz
+      - uses: actions/upload-artifact@v3
+        with:
+          name: prep-workspace
+          path: prep-workspace.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/rust:1.98.1-bookworm
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: carolina_dev
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/carolina_dev
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          sh scripts/ci-restore.sh
+      - run: cargo test --locked
+
+  clippy:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/rust:1.98.1-bookworm
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          sh scripts/ci-restore.sh
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  audit:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/rust:1.98.1-bookworm
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          sh scripts/ci-restore.sh
+      - run: cargo audit
+
+  gitleaks:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          sh scripts/ci-restore.sh
+      - run: gitleaks detect --source . --verbose
+
+  fmt:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/rust:1.98.1-bookworm
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+          sh scripts/ci-restore.sh
+      - run: cargo fmt --all -- --check

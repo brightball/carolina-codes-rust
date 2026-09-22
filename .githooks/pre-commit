@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# In-repo pre-commit entry. Prefer the pre-commit runner so named hooks
+# match .pre-commit-config.yaml; fall back to the same Makefile targets.
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+export PATH="${HOME}/.local/share/mise/installs/gitleaks/latest:${HOME}/.cargo/bin:${HOME}/.local/bin:${PATH}"
+if command -v pre-commit >/dev/null 2>&1; then
+  exec pre-commit run --hook-stage pre-commit --all-files
+fi
+make fmt
+make clippy
+make test
+make audit
+make secrets
