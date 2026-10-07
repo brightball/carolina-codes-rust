@@ -803,6 +803,17 @@ mod tests {
             .unwrap_or_else(|err| panic!("read {rel}: {err}"))
     }
 
+    fn quoted_after<'a>(text: &'a str, key: &str) -> &'a str {
+        let rest = text
+            .split_once(key)
+            .unwrap_or_else(|| panic!("missing {key}"))
+            .1;
+        let end = rest
+            .find('"')
+            .unwrap_or_else(|| panic!("missing end quote after {key}"));
+        &rest[..end]
+    }
+
     fn gitea_jobs(yaml: &str) -> HashMap<String, String> {
         let rest = yaml
             .split_once("\njobs:\n")
@@ -1855,6 +1866,93 @@ INSERT INTO sponsorships_src (sponsor_slug, year, tier, blurb, featured) VALUES
             let lower = sql.to_ascii_lowercase();
             assert!(lower.contains("v1_"), "{sql}");
             assert!(!lower.contains("ash"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn docs_name_versions_memory_and_v1_views() {
+        let readme = repo_file("README.md");
+        let agents = repo_file("AGENTS.md");
+        let decisions = repo_file("DECISIONS.md");
+        let memory = repo_file("MEMORY.md");
+        let toolchain = repo_file("rust-toolchain.toml");
+        let cargo = repo_file("Cargo.toml");
+        let docker = repo_file("Dockerfile");
+
+        let rustc = quoted_after(&toolchain, "channel = \"");
+        assert!(readme.contains("1.98.1"), "README must name Rust 1.98.1");
+        assert!(
+            readme.contains(rustc),
+            "README must name the rust-toolchain.toml channel {rustc}"
+        );
+        assert!(
+            docker.contains(&format!("rust:{rustc}-bookworm")),
+            "Dockerfile must build with the pinned toolchain {rustc}"
+        );
+
+        let axum = quoted_after(&cargo, "axum = \"");
+        assert!(readme.contains("0.8"), "README must name axum 0.8");
+        assert!(
+            readme.contains(axum) && readme.contains("axum"),
+            "README must name the Cargo.toml axum version {axum}"
+        );
+        for name in [
+            "tokio",
+            "tokio-postgres",
+            "deadpool-postgres",
+            "reqwest",
+            "rustls",
+        ] {
+            assert!(readme.contains(name), "README must name {name}");
+        }
+        assert!(
+            !readme.to_ascii_lowercase().contains("crac"),
+            "README must not claim CRaC"
+        );
+
+        assert!(
+            agents.contains("MEMORY.md"),
+            "AGENTS.md must name MEMORY.md"
+        );
+        assert!(
+            agents.contains("DECISIONS.md"),
+            "AGENTS.md must name DECISIONS.md"
+        );
+        assert!(
+            decisions.contains("v1_") && decisions.contains("Ash"),
+            "DECISIONS.md must record querying v1_* views rather than Ash tables"
+        );
+        assert!(
+            memory.contains("axum") && decisions.contains("axum"),
+            "MEMORY.md and DECISIONS.md must name the axum stack"
+        );
+
+        for (label, doc) in [
+            ("README.md", &readme),
+            ("AGENTS.md", &agents),
+            ("DECISIONS.md", &decisions),
+            ("MEMORY.md", &memory),
+        ] {
+            assert!(
+                !doc.contains("zebra-hydra"),
+                "{label} must not name the tailnet"
+            );
+            assert!(
+                !doc.contains("ts.net"),
+                "{label} must not name a tailnet host"
+            );
+            assert!(
+                !doc.contains("/home/"),
+                "{label} must not contain a home path"
+            );
+            assert!(
+                !doc.contains(".internal"),
+                "{label} must not contain a Fly internal URL"
+            );
+            assert!(
+                !doc.contains("flycast"),
+                "{label} must not contain a Flycast host"
+            );
         }
     }
 

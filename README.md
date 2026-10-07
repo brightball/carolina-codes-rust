@@ -1,6 +1,8 @@
 # carolina-codes-rust
 
-Read-only [axum](https://github.com/tokio-rs/axum) + `tokio-postgres` API for the Carolina Code Conference polyglot site.
+Read-only [axum](https://github.com/tokio-rs/axum) 0.8 + `tokio-postgres` API for the Carolina Code Conference polyglot site. Rust **1.98.1** is pinned in `rust-toolchain.toml` and in the image `rust:1.98.1-bookworm`.
+
+Runtime crates: `tokio` 1, `tokio-postgres` 0.7, `deadpool-postgres` 0.14, and `reqwest` 0.12 built with `rustls-tls`.
 
 Queries PostgreSQL **v1 views** only (`v1_years`, `v1_speakers`, `v1_talks`, `v1_sponsors`, `v1_year_sponsors`, `v1_sponsorships`). Registers with Elixir once on boot.
 
