@@ -10,7 +10,7 @@ Before changing architecture, read `MEMORY.md` (stack, commands, and constraints
 
 1. Query PostgreSQL **v1 views** only. Never query Ash resource tables.
 2. Expose the v1 routes below.
-3. **Register once on boot** with the Elixir site (no heartbeat). If `CAROLINA_URL` is unset or the CMS is down, log and continue serving.
+3. **Register once on boot** with the Elixir site (no heartbeat). If `CAROLINA_URL` or the token is empty, skip registration and keep serving. If the POST fails because the CMS is down, log and keep serving.
 
 ## Environment
 
@@ -53,7 +53,7 @@ Content-Type: application/json
 
 Body fields: `language`, `language_version`, `api_version`, `framework`, `created_year`, `base_url` (`PUBLIC_BASE_URL`, or `http://127.0.0.1:{PORT}` when that is unset), `schema_version` (1), `endpoints` (the same method, path, and query list that `GET /` returns).
 
-Do not heartbeat. If `CAROLINA_URL` or the token is empty, or the POST fails, log and keep serving. Registration is spawned so it does not block accept.
+Do not heartbeat. An empty `CAROLINA_URL` or token skips registration and does not log. If the HTTP client cannot be built or the POST fails, log and keep serving. Registration is spawned after the listener binds, so it does not block accept.
 
 ## This repository
 

@@ -814,6 +814,98 @@ mod tests {
         &rest[..end]
     }
 
+    fn heading_section<'a>(text: &'a str, heading: &str) -> &'a str {
+        let rest = text
+            .split_once(heading)
+            .unwrap_or_else(|| panic!("missing {heading}"))
+            .1;
+        let end = rest.find("\n## ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    fn empty_skip_claimed_as_logged(text: &str) -> bool {
+        text.split(['.', '\n']).any(|sentence| {
+            let s = sentence.to_ascii_lowercase();
+            let mentions_empty = s.contains("empty") || s.contains("unset");
+            let mentions_log = s.contains("log");
+            let says_silent = s.contains("without log")
+                || s.contains("does not log")
+                || s.contains("no log")
+                || s.contains("not logged");
+            mentions_empty && mentions_log && !says_silent
+        })
+    }
+
+    fn assert_docs_follow_boot_and_register(agents: &str, decisions: &str, memory: &str) {
+        let boot = fn_body(src(), "async fn boot(");
+        let bind_at = boot.find("TcpListener::bind").expect("boot binds");
+        let prewarm_at = boot.find("prewarm_pool(").expect("boot warms the pool");
+        let register_at = boot.find("spawn(register").expect("boot spawns register");
+        let serve_at = boot.find("axum::serve").expect("boot serves");
+        assert!(
+            bind_at < prewarm_at && prewarm_at < register_at && register_at < serve_at,
+            "boot binds, then spawns warmup and registration, then serves"
+        );
+
+        let health = heading_section(decisions, "## /health before Postgres");
+        let decision = health
+            .lines()
+            .find(|line| line.contains("**Decision:**"))
+            .expect("health decision");
+        let bind_i = decision
+            .find("Bind")
+            .expect("health decision must name the bind");
+        let spawn_i = decision
+            .find("spawn")
+            .expect("health decision must name the spawn");
+        let serve_i = decision
+            .find("axum::serve")
+            .expect("health decision must name axum::serve");
+        assert!(
+            bind_i < spawn_i && spawn_i < serve_i,
+            "health decision must follow boot(): bind, then spawn, then axum::serve; got {decision}"
+        );
+        assert!(
+            !decision.to_ascii_lowercase().contains("only after"),
+            "health decision must not serve only after spawning warmup"
+        );
+
+        let reg = fn_body(src(), "async fn register(");
+        let first_log = reg.find("eprintln!").expect("register logs failures");
+        assert!(
+            reg[..first_log].contains("if url.is_empty()"),
+            "empty CAROLINA_URL returns before any log"
+        );
+        assert!(
+            reg[..first_log].contains("if token.is_empty()"),
+            "empty token returns before any log"
+        );
+        assert!(
+            reg[first_log..].contains("register:"),
+            "a failed register POST is logged"
+        );
+
+        let register_decision = heading_section(decisions, "## Register once, no heartbeat");
+        for (label, text) in [
+            ("AGENTS.md", agents),
+            ("DECISIONS.md", register_decision),
+            ("MEMORY.md", memory),
+        ] {
+            assert!(
+                !empty_skip_claimed_as_logged(text),
+                "{label} must not claim an empty CAROLINA_URL or token is logged"
+            );
+        }
+        assert!(
+            register_decision.to_ascii_lowercase().contains("log"),
+            "register decision must still log a failed POST"
+        );
+        assert!(
+            agents.to_ascii_lowercase().contains("log and keep serving"),
+            "AGENTS.md must still log and continue when the CMS is down"
+        );
+    }
+
     fn gitea_jobs(yaml: &str) -> HashMap<String, String> {
         let rest = yaml
             .split_once("\njobs:\n")
@@ -1926,6 +2018,7 @@ INSERT INTO sponsorships_src (sponsor_slug, year, tier, blurb, featured) VALUES
             memory.contains("axum") && decisions.contains("axum"),
             "MEMORY.md and DECISIONS.md must name the axum stack"
         );
+        assert_docs_follow_boot_and_register(&agents, &decisions, &memory);
 
         for (label, doc) in [
             ("README.md", &readme),

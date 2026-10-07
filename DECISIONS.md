@@ -20,14 +20,14 @@ Accepted choices for this Rust + axum API. Each record is status, context, decis
 
 - **Status:** Accepted
 - **Context:** `Carolina.Polyglot` keeps at most one language API warm and keep-alives that process. This process must still serve HTTP when the CMS is down.
-- **Decision:** Spawn one `POST {CAROLINA_URL}/internal/api-endpoints/register` on boot, with bearer `POLYGLOT_REGISTER_TOKEN`. If the URL or token is empty, or the POST fails, log and keep serving. There is no heartbeat.
+- **Decision:** Spawn one `POST {CAROLINA_URL}/internal/api-endpoints/register` on boot, with bearer `POLYGLOT_REGISTER_TOKEN`. If `CAROLINA_URL` or the token is empty, return without logging and keep serving. If the client cannot be built or the POST fails, log and keep serving. There is no heartbeat.
 - **Consequences:** Registration does not run catalog SQL and does not block accept. Do not add a periodic register loop.
 
 ## /health before Postgres
 
 - **Status:** Accepted
 - **Context:** The platform probes `GET /health`. A Postgres connect can sit for the full connect timeout when the database is slow or unreachable.
-- **Decision:** Bind the listener and call `axum::serve` only after spawning pool warmup and registration. `GET /health` returns `{ "ok": true }` and runs no SQL.
+- **Decision:** Bind the listener first, then spawn pool warmup and registration, then call `axum::serve`. `GET /health` returns `{ "ok": true }` and runs no SQL.
 - **Consequences:** Liveness does not wait on Postgres or the CMS. Catalog routes still fail until the pool can connect.
 
 ## IPv6 listen

@@ -36,7 +36,7 @@ Emergency skip: `SKIP=fmt,clippy,local-tests,audit,gitleaks git commit`.
 - Lists use `{ "data": [ ... ] }`. Missing records use 404 `{ "error": "not_found" }`.
 - `GET /health` returns `{ "ok": true }`, runs no SQL, and does not check out a connection.
 - Every response sets `X-Polyglot-Language` and `X-Polyglot-Framework`.
-- Register once with `POST {CAROLINA_URL}/internal/api-endpoints/register`. No heartbeat. Log and keep serving if the CMS is down.
+- Register once with `POST {CAROLINA_URL}/internal/api-endpoints/register`. No heartbeat. An empty `CAROLINA_URL` or token returns without logging. If the POST fails because the CMS is down, log and keep serving.
 - `photo_path` and `logo_path` are returned as stored. This process does not serve image bytes.
 
 ## Environment
